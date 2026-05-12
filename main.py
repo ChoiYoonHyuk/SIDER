@@ -1,6 +1,8 @@
 import argparse
 import copy
 import math
+import os
+import os.path as osp
 import random
 import time
 
@@ -9,7 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from torch_geometric.datasets import Actor, Planetoid, WebKB, WikipediaNetwork
+from torch_geometric.data import Data
+from torch_geometric.datasets import Actor, LINKXDataset, Planetoid, WebKB, WikipediaNetwork
 from torch_geometric.transforms import NormalizeFeatures
 from torch_geometric.utils import remove_self_loops, to_undirected
 
@@ -274,8 +277,37 @@ class LINKXNet(nn.Module):
 # Utilities
 # -----------------------------
 
+SNAP_PATENTS_GDRIVE_ID = '1ldh23TSY1PwXia6dU0MYcpyEgX-w3Hia'
+
+
+class SingleGraphDataset:
+    """Small adapter so external single-graph loaders look like PyG datasets."""
+
+    def __init__(self, name, data, num_classes):
+        self.name = name
+        self.data = data
+        self.num_classes = int(num_classes)
+        self.num_node_features = int(data.num_node_features)
+
+    def __getitem__(self, idx):
+        if idx != 0:
+            raise IndexError('single graph dataset only contains graph 0')
+        return self.data
+
+    def __len__(self):
+        return 1
+
+    def __repr__(self):
+        return f'{self.name}(1)'
+
+
 def is_hetero_dataset(data_id):
     return data_id >= 3
+
+
+def is_large_hetero_dataset(data_id):
+    return data_id >= 9
+
 
 
 def set_seed(seed):
@@ -327,6 +359,156 @@ def random_balanced_split(data, class_count, train_per_class, num_val, num_test,
     data.test_mask = test_mask
 
     return data
+
+
+def random_prop_split(data, train_prop, val_prop, seed, ignore_negative=True):
+    """Random split used by the large heterophily benchmark datasets."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    y = data.y.view(-1)
+    if ignore_negative:
+        idx = (y >= 0).nonzero(as_tuple=False).view(-1)
+    else:
+        idx = torch.arange(data.num_nodes)
+
+    idx = idx[torch.randperm(idx.numel(), generator=generator)]
+    train_n = int(idx.numel() * train_prop)
+    val_n = int(idx.numel() * val_prop)
+
+    train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+
+    train_mask[idx[:train_n]] = True
+    val_mask[idx[train_n:train_n + val_n]] = True
+    test_mask[idx[train_n + val_n:]] = True
+
+    data.train_mask = train_mask
+    data.val_mask = val_mask
+    data.test_mask = test_mask
+
+    return data
+
+
+def sanitize_labels_and_masks(data, class_count):
+    y = data.y.view(-1).long()
+    valid = (y >= 0) & (y < class_count)
+
+    for mask_name in ['train_mask', 'val_mask', 'test_mask']:
+        mask = getattr(data, mask_name, None)
+        if mask is not None:
+            setattr(data, mask_name, mask.bool() & valid)
+
+    data.y = torch.where(valid, y, torch.zeros_like(y))
+    return data
+
+
+def even_quantile_labels(vals, nclasses):
+    """Convert continuous years to balanced ordinal classes by quantile."""
+    vals = np.asarray(vals).reshape(-1)
+    labels = -1 * np.ones(vals.shape[0], dtype=np.int64)
+    lower = -np.inf
+
+    for k in range(nclasses - 1):
+        upper = np.nanquantile(vals, (k + 1) / nclasses)
+        labels[(vals >= lower) & (vals < upper)] = k
+        lower = upper
+
+    labels[vals >= lower] = nclasses - 1
+    return labels
+
+
+def make_large_dataset(name, data, class_count, args, transform):
+    if transform is not None:
+        data = transform(data)
+
+    data.y = data.y.view(-1).long()
+    data = random_prop_split(
+        data,
+        train_prop=args.train_prop,
+        val_prop=args.val_prop,
+        seed=args.seed,
+        ignore_negative=True
+    )
+    data = sanitize_labels_and_masks(data, class_count)
+
+    return SingleGraphDataset(name, data, class_count)
+
+
+def load_arxiv_year_dataset(args, transform):
+    try:
+        from ogb.nodeproppred import NodePropPredDataset
+    except ImportError as exc:
+        raise ImportError(
+            'arXiv-year requires OGB. Install it with `pip install ogb`.'
+        ) from exc
+
+    ogb_dataset = NodePropPredDataset(
+        name='ogbn-arxiv',
+        root=osp.join(args.root, 'ogb')
+    )
+    graph, _ = ogb_dataset[0]
+
+    x = torch.as_tensor(graph['node_feat'], dtype=torch.float)
+    edge_index = torch.as_tensor(graph['edge_index'], dtype=torch.long)
+    years = np.asarray(graph['node_year']).reshape(-1)
+    y = torch.as_tensor(
+        even_quantile_labels(years, args.year_classes),
+        dtype=torch.long
+    )
+
+    data = Data(x=x, edge_index=edge_index, y=y, num_nodes=x.size(0))
+    return make_large_dataset('arXiv-year', data, args.year_classes, args, transform)
+
+
+def load_snap_patents_dataset(args, transform):
+    try:
+        import scipy.io
+    except ImportError as exc:
+        raise ImportError(
+            'snap-patents requires scipy. Install it with `pip install scipy`.'
+        ) from exc
+
+    data_path = args.snap_patents_path
+    if data_path is None:
+        data_dir = osp.join(args.root, 'snap-patents')
+        os.makedirs(data_dir, exist_ok=True)
+        data_path = osp.join(data_dir, 'snap_patents.mat')
+
+    if not osp.exists(data_path):
+        try:
+            import gdown
+        except ImportError as exc:
+            raise ImportError(
+                'snap-patents download requires gdown. Install it with '
+                '`pip install gdown`, or pass --snap-patents-path to a local '
+                'snap_patents.mat file.'
+            ) from exc
+
+        gdown.download(
+            id=SNAP_PATENTS_GDRIVE_ID,
+            output=data_path,
+            quiet=False
+        )
+
+    full_data = scipy.io.loadmat(data_path)
+    edge_index = torch.as_tensor(full_data['edge_index'], dtype=torch.long)
+
+    node_feat = full_data['node_feat']
+    if hasattr(node_feat, 'todense'):
+        node_feat = np.asarray(node_feat.todense())
+    x = torch.as_tensor(node_feat, dtype=torch.float)
+
+    num_nodes = int(np.asarray(full_data['num_nodes']).reshape(-1)[0])
+    years = np.asarray(full_data['years']).reshape(-1)
+    y = torch.as_tensor(
+        even_quantile_labels(years, args.year_classes),
+        dtype=torch.long
+    )
+
+    data = Data(x=x, edge_index=edge_index, y=y, num_nodes=num_nodes)
+    return make_large_dataset('snap-patents', data, args.year_classes, args, transform)
 
 
 def load_dataset(data_id, args):
@@ -397,28 +579,46 @@ def load_dataset(data_id, args):
             name='Wisconsin',
             transform=transform
         )
+    elif data_id == 9:
+        dataset = LINKXDataset(
+            root=osp.join(args.root, 'LINKX'),
+            name='penn94',
+            transform=transform
+        )
+    elif data_id == 10:
+        dataset = load_arxiv_year_dataset(args, transform)
+    elif data_id == 11:
+        dataset = load_snap_patents_dataset(args, transform)
     else:
-        raise ValueError('data must be an integer from 0 to 8')
+        raise ValueError('data must be an integer from 0 to 11')
 
     data = dataset[0]
     class_count = int(dataset.num_classes)
-
-    # Defensive handling for rare invalid labels.
-    data.y = torch.where(data.y > class_count - 1, torch.zeros_like(data.y), data.y)
 
     if hasattr(data, 'train_mask') and data.train_mask is not None:
         data.train_mask = select_mask(data.train_mask, args.split_id)
         data.val_mask = select_mask(data.val_mask, args.split_id)
         data.test_mask = select_mask(data.test_mask, args.split_id)
     else:
-        data = random_balanced_split(
-            data,
-            class_count,
-            args.train_per_class,
-            args.num_val,
-            args.num_test,
-            args.seed
-        )
+        if is_large_hetero_dataset(data_id):
+            data = random_prop_split(
+                data,
+                train_prop=args.train_prop,
+                val_prop=args.val_prop,
+                seed=args.seed,
+                ignore_negative=True
+            )
+        else:
+            data = random_balanced_split(
+                data,
+                class_count,
+                args.train_per_class,
+                args.num_val,
+                args.num_test,
+                args.seed
+            )
+
+    data = sanitize_labels_and_masks(data, class_count)
 
     edge_index, _ = remove_self_loops(data.edge_index)
 
@@ -516,10 +716,16 @@ def evaluate(model, data, adj):
 def fill_defaults(args):
     """
     Keep homophilic datasets 0~2 on the original GCNII branch.
-    Use a separate heterophilic branch for datasets 3~8.
+    Use small-graph heterophily defaults for datasets 3~8 and more
+    memory-friendly defaults for large heterophily datasets 9~11.
     """
     if args.model == 'auto':
-        args.model = 'gcnii' if args.data <= 2 else 'h2gcn'
+        if args.data <= 2:
+            args.model = 'gcnii'
+        elif is_large_hetero_dataset(args.data):
+            args.model = 'gpr'
+        else:
+            args.model = 'h2gcn'
 
     preset = {}
 
@@ -603,10 +809,11 @@ def fill_defaults(args):
 
     elif args.model == 'gpr':
         hetero = is_hetero_dataset(args.data)
+        large = is_large_hetero_dataset(args.data)
         preset = {
-            'epochs': 1500,
-            'patience': 300 if hetero else 200,
-            'hidden': 128 if hetero else 64,
+            'epochs': 1500 if not large else 1000,
+            'patience': 300 if hetero and not large else 200,
+            'hidden': 64 if large else (128 if hetero else 64),
             'layers': 2,
             'dropout': 0.5,
             'lr': 0.01,
@@ -615,7 +822,7 @@ def fill_defaults(args):
             'alpha': 0.5 if hetero else 0.1,
             'lamda': 0.5,
             'selection': 'val_acc',
-            'propagation_steps': 10,
+            'propagation_steps': 5 if large else 10,
             'mlp_layers': 2,
             'label_smoothing': 0.0,
             'dropedge': 0.0,
@@ -971,6 +1178,10 @@ def parse_args():
     parser.add_argument('--train-per-class', type=int, default=20)
     parser.add_argument('--num-val', type=int, default=500)
     parser.add_argument('--num-test', type=int, default=1000)
+    parser.add_argument('--train-prop', type=float, default=0.5)
+    parser.add_argument('--val-prop', type=float, default=0.25)
+    parser.add_argument('--year-classes', type=int, default=5)
+    parser.add_argument('--snap-patents-path', type=str, default=None)
 
     parser.add_argument('--force-undirected', action='store_true', default=True)
     parser.add_argument('--keep-directed', dest='force_undirected', action='store_false')
@@ -1008,6 +1219,13 @@ def parse_args():
     if args.weight_decay is not None:
         args.wd1 = args.weight_decay
         args.wd2 = args.weight_decay
+
+    if not (0.0 < args.train_prop < 1.0):
+        raise ValueError('--train-prop must be in (0, 1)')
+    if not (0.0 <= args.val_prop < 1.0):
+        raise ValueError('--val-prop must be in [0, 1)')
+    if args.train_prop + args.val_prop >= 1.0:
+        raise ValueError('--train-prop + --val-prop must be < 1')
 
     return args
 
@@ -1047,7 +1265,7 @@ def main():
     tests = np.array([r['best_test_acc'] for r in results], dtype=np.float64)
     times = np.array([r['time'] for r in results], dtype=np.float64)
 
-    print('dataset', dataset.__class__.__name__)
+    print('dataset', getattr(dataset, 'name', dataset.__class__.__name__))
     print('model', args.model)
     print('split', args.split)
     print('selection', args.selection)
