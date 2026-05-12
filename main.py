@@ -5,6 +5,8 @@ import os
 import os.path as osp
 import random
 import time
+import urllib.request
+import warnings
 
 import numpy as np
 import torch
@@ -86,7 +88,7 @@ class GCNII(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, layers, dropout):
+    def __init__(self, in_dim, hidden_dim, out_dim, layers, dropout, use_bn=False):
         super().__init__()
         modules = []
 
@@ -94,11 +96,15 @@ class MLP(nn.Module):
             modules.append(nn.Linear(in_dim, out_dim))
         else:
             modules.append(nn.Linear(in_dim, hidden_dim))
+            if use_bn:
+                modules.append(nn.BatchNorm1d(hidden_dim))
             modules.append(nn.ReLU())
             modules.append(nn.Dropout(dropout))
 
             for _ in range(layers - 2):
                 modules.append(nn.Linear(hidden_dim, hidden_dim))
+                if use_bn:
+                    modules.append(nn.BatchNorm1d(hidden_dim))
                 modules.append(nn.ReLU())
                 modules.append(nn.Dropout(dropout))
 
@@ -113,18 +119,18 @@ class MLP(nn.Module):
 class MLPNet(nn.Module):
     """MLP baseline with the same forward signature as graph models."""
 
-    def __init__(self, in_dim, hidden_dim, out_dim, layers, dropout):
+    def __init__(self, in_dim, hidden_dim, out_dim, layers, dropout, use_bn=False):
         super().__init__()
-        self.mlp = MLP(in_dim, hidden_dim, out_dim, layers, dropout)
+        self.mlp = MLP(in_dim, hidden_dim, out_dim, layers, dropout, use_bn=use_bn)
 
     def forward(self, x, adj=None):
         return self.mlp(x)
 
 
 class APPNPNet(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, mlp_layers, propagation_steps, alpha, dropout):
+    def __init__(self, in_dim, hidden_dim, out_dim, mlp_layers, propagation_steps, alpha, dropout, use_bn=False):
         super().__init__()
-        self.mlp = MLP(in_dim, hidden_dim, out_dim, mlp_layers, dropout)
+        self.mlp = MLP(in_dim, hidden_dim, out_dim, mlp_layers, dropout, use_bn=use_bn)
         self.propagation_steps = propagation_steps
         self.alpha = alpha
         self.dropout = dropout
@@ -140,9 +146,9 @@ class APPNPNet(nn.Module):
 
 
 class DAGNNNet(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, mlp_layers, propagation_steps, dropout):
+    def __init__(self, in_dim, hidden_dim, out_dim, mlp_layers, propagation_steps, dropout, use_bn=False):
         super().__init__()
-        self.mlp = MLP(in_dim, hidden_dim, out_dim, mlp_layers, dropout)
+        self.mlp = MLP(in_dim, hidden_dim, out_dim, mlp_layers, dropout, use_bn=use_bn)
         self.att = nn.Linear(out_dim, 1, bias=False)
         self.propagation_steps = propagation_steps
         self.dropout = dropout
@@ -161,9 +167,9 @@ class DAGNNNet(nn.Module):
 
 
 class GPRNet(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, mlp_layers, propagation_steps, alpha, dropout, init):
+    def __init__(self, in_dim, hidden_dim, out_dim, mlp_layers, propagation_steps, alpha, dropout, init, use_bn=False):
         super().__init__()
-        self.mlp = MLP(in_dim, hidden_dim, out_dim, mlp_layers, dropout)
+        self.mlp = MLP(in_dim, hidden_dim, out_dim, mlp_layers, dropout, use_bn=use_bn)
         self.propagation_steps = propagation_steps
         self.dropout = dropout
 
@@ -185,6 +191,12 @@ class GPRNet(nn.Module):
             # Alternating signed initialization for heterophilic graphs.
             vals = [((-alpha) ** k) for k in range(steps + 1)]
             vals = torch.tensor(vals, dtype=torch.float)
+            return vals / (vals.abs().sum() + 1e-12)
+
+        if init == 'random':
+            # Matches the commonly used GPR-GNN random coefficient start.
+            bound = math.sqrt(3.0 / (steps + 1))
+            vals = torch.empty(steps + 1, dtype=torch.float).uniform_(-bound, bound)
             return vals / (vals.abs().sum() + 1e-12)
 
         # sgc
@@ -213,13 +225,13 @@ class H2GCNLite(nn.Module):
     neighbor channels too early.
     """
 
-    def __init__(self, in_dim, hidden_dim, out_dim, hops, dropout):
+    def __init__(self, in_dim, hidden_dim, out_dim, hops, dropout, use_bn=False):
         super().__init__()
         self.hops = hops
         self.dropout = dropout
 
         self.lin = nn.Linear(in_dim, hidden_dim)
-        self.pred = MLP(hidden_dim * (hops + 1), hidden_dim, out_dim, 2, dropout)
+        self.pred = MLP(hidden_dim * (hops + 1), hidden_dim, out_dim, 2, dropout, use_bn=use_bn)
 
     def forward(self, x, adj):
         h0 = F.dropout(x, self.dropout, training=self.training)
@@ -239,38 +251,276 @@ class H2GCNLite(nn.Module):
 
 class LINKXNet(nn.Module):
     """
-    Lightweight LINKX-style model.
+    LINKX-style model close to the official implementation.
 
-    It separately embeds adjacency structure and node features, then combines them.
-    This is useful for non-homophilous graphs where feature and topology signals
-    should not be forced through the same smoothing operator.
+    a = MLP_A(A), x = MLP_X(X), h = ReLU(W[a, x] + a + x), y = MLP_final(h).
+    The adjacency branch is implemented as sparse A @ W to avoid materializing
+    a dense N x N input matrix.
     """
 
-    def __init__(self, in_dim, num_nodes, hidden_dim, out_dim, dropout):
+    def __init__(
+        self,
+        in_dim,
+        num_nodes,
+        hidden_dim,
+        out_dim,
+        dropout,
+        use_bn=False,
+        skip=True,
+        init_layers_x=1,
+        final_layers=2,
+        inner_activation=False,
+        inner_dropout=False,
+    ):
         super().__init__()
         self.dropout = dropout
+        self.skip = skip
+        self.inner_activation = inner_activation
+        self.inner_dropout = inner_dropout
 
         self.adj_weight = nn.Parameter(torch.empty(num_nodes, hidden_dim))
         self.adj_bias = nn.Parameter(torch.zeros(hidden_dim))
 
-        self.x_mlp = MLP(in_dim, hidden_dim, hidden_dim, 2, dropout)
-        self.final_mlp = MLP(hidden_dim * 2, hidden_dim, out_dim, 2, dropout)
+        # Official LINKX uses zero dropout in the initial A/X embedding MLPs and
+        # applies dropout in the final MLP.  Keeping this separation matters on
+        # the large non-homophily benchmarks.
+        self.x_mlp = MLP(
+            in_dim,
+            hidden_dim,
+            hidden_dim,
+            init_layers_x,
+            dropout=0.0,
+            use_bn=use_bn,
+        )
+        self.merge = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.final_mlp = MLP(
+            hidden_dim,
+            hidden_dim,
+            out_dim,
+            final_layers,
+            dropout=dropout,
+            use_bn=use_bn,
+        )
 
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.adj_weight)
         nn.init.zeros_(self.adj_bias)
+        self.merge.reset_parameters()
 
     def forward(self, x, adj):
+        # For LINKX, pass raw adjacency: no normalization and no self-loops.
         a_emb = torch.sparse.mm(adj, self.adj_weight) + self.adj_bias
         a_emb = F.relu(a_emb)
 
-        x_emb = self.x_mlp(F.dropout(x, self.dropout, training=self.training))
+        x_emb = self.x_mlp(x)
 
-        h = torch.cat([a_emb, x_emb], dim=1)
-        h = F.dropout(h, self.dropout, training=self.training)
+        h = self.merge(torch.cat([a_emb, x_emb], dim=1))
+        if self.inner_dropout:
+            h = F.dropout(h, self.dropout, training=self.training)
+        if self.inner_activation:
+            h = F.relu(h)
+
+        if self.skip:
+            h = F.relu(h + a_emb + x_emb)
+        else:
+            h = F.relu(h)
+
         return self.final_mlp(h)
+
+
+class GCNNet(nn.Module):
+    """Small full-batch GCN baseline using the same sparse adjacency path."""
+
+    def __init__(self, in_dim, hidden_dim, out_dim, layers, dropout, use_bn=False):
+        super().__init__()
+        self.dropout = dropout
+        self.use_bn = use_bn
+        self.lins = nn.ModuleList()
+        self.bns = nn.ModuleList()
+
+        if layers <= 1:
+            self.lins.append(nn.Linear(in_dim, out_dim))
+        else:
+            self.lins.append(nn.Linear(in_dim, hidden_dim))
+            if use_bn:
+                self.bns.append(nn.BatchNorm1d(hidden_dim))
+            for _ in range(layers - 2):
+                self.lins.append(nn.Linear(hidden_dim, hidden_dim))
+                if use_bn:
+                    self.bns.append(nn.BatchNorm1d(hidden_dim))
+            self.lins.append(nn.Linear(hidden_dim, out_dim))
+
+    def forward(self, x, adj):
+        if len(self.lins) == 1:
+            return self.lins[0](torch.sparse.mm(adj, x))
+
+        h = x
+        for i, lin in enumerate(self.lins[:-1]):
+            h = torch.sparse.mm(adj, h)
+            h = lin(h)
+            if self.use_bn:
+                h = self.bns[i](h)
+            h = F.relu(h)
+            h = F.dropout(h, self.dropout, training=self.training)
+
+        h = torch.sparse.mm(adj, h)
+        return self.lins[-1](h)
+
+
+class MixHopLayer(nn.Module):
+    """MixHop layer: concatenate learned projections from A^0, A^1, ..., A^K."""
+
+    def __init__(self, in_dim, out_dim, hops):
+        super().__init__()
+        self.hops = hops
+        self.lins = nn.ModuleList([
+            nn.Linear(in_dim, out_dim) for _ in range(hops + 1)
+        ])
+
+    def forward(self, x, adj):
+        outs = [self.lins[0](x)]
+        for hop in range(1, self.hops + 1):
+            h = self.lins[hop](x)
+            for _ in range(hop):
+                h = torch.sparse.mm(adj, h)
+            outs.append(h)
+        return torch.cat(outs, dim=1)
+
+
+class MixHopNet(nn.Module):
+    """Scalable MixHop baseline used as a strong non-homophily comparator."""
+
+    def __init__(self, in_dim, hidden_dim, out_dim, layers, hops, dropout, use_bn=False):
+        super().__init__()
+        self.dropout = dropout
+        self.use_bn = use_bn
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+
+        if layers <= 1:
+            self.convs.append(MixHopLayer(in_dim, out_dim, hops))
+            self.final_project = nn.Linear(out_dim * (hops + 1), out_dim)
+        else:
+            self.convs.append(MixHopLayer(in_dim, hidden_dim, hops))
+            if use_bn:
+                self.bns.append(nn.BatchNorm1d(hidden_dim * (hops + 1)))
+            for _ in range(layers - 2):
+                self.convs.append(MixHopLayer(hidden_dim * (hops + 1), hidden_dim, hops))
+                if use_bn:
+                    self.bns.append(nn.BatchNorm1d(hidden_dim * (hops + 1)))
+            self.convs.append(MixHopLayer(hidden_dim * (hops + 1), out_dim, hops))
+            self.final_project = nn.Linear(out_dim * (hops + 1), out_dim)
+
+    def forward(self, x, adj):
+        h = x
+        for i, conv in enumerate(self.convs[:-1]):
+            h = conv(h, adj)
+            if self.use_bn:
+                h = self.bns[i](h)
+            h = F.relu(h)
+            h = F.dropout(h, self.dropout, training=self.training)
+        h = self.convs[-1](h, adj)
+        return self.final_project(h)
+
+
+class ACMGCNLayer(nn.Module):
+    """
+    Adaptive Channel Mixing layer, simplified for this standalone script.
+
+    It mixes three channels node-wise: low-pass aggregation, high-pass
+    diversification, and identity/MLP.  This is a practical ACM-GCN-lite option
+    for heterophily; it does not enable the optional structure-info channel.
+    """
+
+    def __init__(self, in_dim, out_dim, use_layer_norm=True, variant=False):
+        super().__init__()
+        self.variant = variant
+        self.use_layer_norm = use_layer_norm
+
+        self.weight_low = nn.Parameter(torch.empty(in_dim, out_dim))
+        self.weight_high = nn.Parameter(torch.empty(in_dim, out_dim))
+        self.weight_mlp = nn.Parameter(torch.empty(in_dim, out_dim))
+
+        self.att_vec_low = nn.Parameter(torch.empty(out_dim, 1))
+        self.att_vec_high = nn.Parameter(torch.empty(out_dim, 1))
+        self.att_vec_mlp = nn.Parameter(torch.empty(out_dim, 1))
+        self.att_vec = nn.Parameter(torch.empty(3, 3))
+
+        if use_layer_norm:
+            self.norm_low = nn.LayerNorm(out_dim)
+            self.norm_high = nn.LayerNorm(out_dim)
+            self.norm_mlp = nn.LayerNorm(out_dim)
+        else:
+            self.norm_low = self.norm_high = self.norm_mlp = nn.Identity()
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        bound = 1.0 / math.sqrt(self.weight_mlp.size(1))
+        att_bound = 1.0 / math.sqrt(self.att_vec_mlp.size(1))
+        mix_bound = 1.0 / math.sqrt(self.att_vec.size(1))
+        for weight in [self.weight_low, self.weight_high, self.weight_mlp]:
+            nn.init.uniform_(weight, -bound, bound)
+        for weight in [self.att_vec_low, self.att_vec_high, self.att_vec_mlp]:
+            nn.init.uniform_(weight, -att_bound, att_bound)
+        nn.init.uniform_(self.att_vec, -mix_bound, mix_bound)
+        for norm in [self.norm_low, self.norm_high, self.norm_mlp]:
+            if hasattr(norm, 'reset_parameters'):
+                norm.reset_parameters()
+
+    def _attention(self, low, high, mlp):
+        logits = torch.cat([
+            torch.mm(self.norm_low(low), self.att_vec_low),
+            torch.mm(self.norm_high(high), self.att_vec_high),
+            torch.mm(self.norm_mlp(mlp), self.att_vec_mlp),
+        ], dim=1)
+        logits = torch.mm(torch.sigmoid(logits), self.att_vec) / 3.0
+        att = torch.softmax(logits, dim=1)
+        return att[:, 0:1], att[:, 1:2], att[:, 2:3]
+
+    def forward(self, x, adj_low, adj_high):
+        if self.variant:
+            low = torch.sparse.mm(adj_low, F.relu(torch.mm(x, self.weight_low)))
+            high = torch.sparse.mm(adj_high, F.relu(torch.mm(x, self.weight_high)))
+            mlp = F.relu(torch.mm(x, self.weight_mlp))
+        else:
+            low = F.relu(torch.sparse.mm(adj_low, torch.mm(x, self.weight_low)))
+            high = F.relu(torch.sparse.mm(adj_high, torch.mm(x, self.weight_high)))
+            mlp = F.relu(torch.mm(x, self.weight_mlp))
+
+        att_low, att_high, att_mlp = self._attention(low, high, mlp)
+        return 3.0 * (att_low * low + att_high * high + att_mlp * mlp)
+
+
+class ACMGCNNet(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, layers, dropout, use_bn=True, variant=False, plus_plus=True):
+        super().__init__()
+        if layers != 2:
+            # The official large-scale ACM-Geometric branch uses two layers.
+            layers = 2
+        self.dropout = dropout
+        self.plus_plus = plus_plus
+        self.conv1 = ACMGCNLayer(in_dim, hidden_dim, use_layer_norm=use_bn, variant=variant)
+        self.conv2 = ACMGCNLayer(hidden_dim, out_dim, use_layer_norm=use_bn, variant=variant)
+        if plus_plus:
+            self.x_skip = MLP(in_dim, hidden_dim, hidden_dim, 1, dropout=0.0, use_bn=False)
+        else:
+            self.x_skip = None
+
+    def forward(self, x, adj):
+        if isinstance(adj, tuple):
+            adj_low, adj_high = adj
+        else:
+            adj_low, adj_high = adj, sparse_identity_minus(adj)
+
+        x_drop = F.dropout(x, self.dropout, training=self.training)
+        h = self.conv1(x_drop, adj_low, adj_high)
+        h = F.dropout(F.relu(h), self.dropout, training=self.training)
+        if self.x_skip is not None:
+            h = h + F.dropout(F.relu(self.x_skip(x)), self.dropout, training=self.training)
+        return self.conv2(h, adj_low, adj_high)
 
 
 # -----------------------------
@@ -278,6 +528,12 @@ class LINKXNet(nn.Module):
 # -----------------------------
 
 SNAP_PATENTS_GDRIVE_ID = '1ldh23TSY1PwXia6dU0MYcpyEgX-w3Hia'
+ARXIV_YEAR_SPLIT_URL = (
+    'https://github.com/CUAI/Non-Homophily-Large-Scale/raw/master/'
+    'data/splits/arxiv-year-splits.npy'
+)
+SNAP_PATENTS_SPLIT_GDRIVE_ID = '12xbBRqd8mtG_XkNLH8dRRNZJvVM4Pw-N'
+
 
 
 class SingleGraphDataset:
@@ -389,6 +645,85 @@ def random_prop_split(data, train_prop, val_prop, seed, ignore_negative=True):
     data.test_mask = test_mask
 
     return data
+
+
+def _indices_to_mask(index, num_nodes):
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    index = torch.as_tensor(index, dtype=torch.long).view(-1)
+    index = index[(index >= 0) & (index < num_nodes)]
+    mask[index] = True
+    return mask
+
+
+def set_masks_from_split(data, split):
+    """Apply a LINKX benchmark split dict to a PyG Data object."""
+    if isinstance(split, np.ndarray) and split.shape == ():
+        split = split.item()
+    if not isinstance(split, dict):
+        raise TypeError('fixed split must be a dictionary of index arrays')
+
+    train_key = 'train' if 'train' in split else 'train_idx'
+    valid_key = 'valid' if 'valid' in split else ('val' if 'val' in split else 'valid_idx')
+    test_key = 'test' if 'test' in split else 'test_idx'
+
+    data.train_mask = _indices_to_mask(split[train_key], data.num_nodes)
+    data.val_mask = _indices_to_mask(split[valid_key], data.num_nodes)
+    data.test_mask = _indices_to_mask(split[test_key], data.num_nodes)
+    return data
+
+
+def _download_fixed_large_split(data_id, args):
+    split_dir = osp.join(args.root, 'LINKX', 'fixed_splits')
+    os.makedirs(split_dir, exist_ok=True)
+
+    if data_id == 10:
+        path = osp.join(split_dir, 'arxiv-year-splits.npy')
+        if not osp.exists(path):
+            urllib.request.urlretrieve(ARXIV_YEAR_SPLIT_URL, path)
+        return path
+
+    if data_id == 11:
+        path = osp.join(split_dir, 'snap-patents-splits.npy')
+        if not osp.exists(path):
+            try:
+                import gdown
+            except ImportError as exc:
+                raise ImportError(
+                    'Fixed snap-patents splits require gdown. Install it with '
+                    '`pip install gdown`, or pass --random-large-splits to use '
+                    'the local random split fallback.'
+                ) from exc
+            gdown.download(
+                id=SNAP_PATENTS_SPLIT_GDRIVE_ID,
+                output=path,
+                quiet=False
+            )
+        return path
+
+    return None
+
+
+def maybe_apply_fixed_large_split(data, data_id, args):
+    """Use benchmark fixed splits for arXiv-year/snap-patents when available."""
+    if not getattr(args, 'use_fixed_large_splits', False):
+        return False
+    if data_id not in [10, 11]:
+        return False
+
+    try:
+        path = _download_fixed_large_split(data_id, args)
+        splits = np.load(path, allow_pickle=True)
+        if isinstance(splits, np.ndarray) and splits.shape == ():
+            splits = [splits.item()]
+        split = splits[args.split_id % len(splits)]
+        set_masks_from_split(data, split)
+        return True
+    except Exception as exc:
+        warnings.warn(
+            f'Could not apply fixed benchmark split for data={data_id}; '
+            f'falling back to the existing random split. Reason: {exc}'
+        )
+        return False
 
 
 def sanitize_labels_and_masks(data, class_count):
@@ -512,7 +847,10 @@ def load_snap_patents_dataset(args, transform):
 
 
 def load_dataset(data_id, args):
-    transform = NormalizeFeatures()
+    # Keep the original feature normalization for datasets 0~8.  The three
+    # large heterophily benchmarks use the raw features from their benchmark
+    # loaders, so we do not row-normalize them here.
+    transform = None if data_id in [9, 10, 11] else NormalizeFeatures()
 
     if data_id == 0:
         dataset = Planetoid(
@@ -595,6 +933,11 @@ def load_dataset(data_id, args):
     data = dataset[0]
     class_count = int(dataset.num_classes)
 
+    # Penn94 ships fixed split masks through LINKXDataset.  For arXiv-year and
+    # snap-patents, prefer the public LINKX/GloGNN split files when available;
+    # otherwise the random split created in make_large_dataset remains in use.
+    maybe_apply_fixed_large_split(data, data_id, args)
+
     if hasattr(data, 'train_mask') and data.train_mask is not None:
         data.train_mask = select_mask(data.train_mask, args.split_id)
         data.val_mask = select_mask(data.val_mask, args.split_id)
@@ -630,7 +973,7 @@ def load_dataset(data_id, args):
     return dataset, data, class_count
 
 
-def sparse_norm_adj(edge_index, num_nodes, device, dropedge=0.0, training=False, add_self_loop=True):
+def sparse_norm_adj(edge_index, num_nodes, device, dropedge=0.0, training=False, add_self_loop=True, norm='sym'):
     edge_index = edge_index.to(device)
 
     if training and dropedge > 0.0:
@@ -645,11 +988,24 @@ def sparse_norm_adj(edge_index, num_nodes, device, dropedge=0.0, training=False,
         src = edge_index[0]
         dst = edge_index[1]
 
-    deg = torch.zeros(num_nodes, device=device)
-    deg.index_add_(0, dst, torch.ones(dst.size(0), device=device))
+    if norm == 'none':
+        values = torch.ones(dst.size(0), device=device)
+    elif norm == 'row':
+        # Row-normalized incoming aggregation: each destination averages its
+        # incoming neighbors.  This is used only by the directed arXiv-year and
+        # snap-patents presets unless explicitly overridden.
+        deg = torch.zeros(num_nodes, device=device)
+        deg.index_add_(0, dst, torch.ones(dst.size(0), device=device))
+        values = deg.clamp_min(1.0).reciprocal()[dst]
+    elif norm == 'sym':
+        deg = torch.zeros(num_nodes, device=device)
+        deg.index_add_(0, dst, torch.ones(dst.size(0), device=device))
 
-    deg_inv_sqrt = deg.clamp_min(1.0).pow(-0.5)
-    values = deg_inv_sqrt[src] * deg_inv_sqrt[dst]
+        deg_inv_sqrt = deg.clamp_min(1.0).pow(-0.5)
+        values = deg_inv_sqrt[src] * deg_inv_sqrt[dst]
+    else:
+        raise ValueError(f'unknown adjacency normalization: {norm}')
+
     indices = torch.stack([dst, src], dim=0)
 
     return torch.sparse_coo_tensor(
@@ -658,6 +1014,60 @@ def sparse_norm_adj(edge_index, num_nodes, device, dropedge=0.0, training=False,
         (num_nodes, num_nodes),
         device=device
     ).coalesce()
+
+
+def sparse_identity(num_nodes, device):
+    idx = torch.arange(num_nodes, device=device)
+    return torch.sparse_coo_tensor(
+        torch.stack([idx, idx], dim=0),
+        torch.ones(num_nodes, device=device),
+        (num_nodes, num_nodes),
+        device=device
+    ).coalesce()
+
+
+def sparse_identity_minus(adj):
+    adj = adj.coalesce()
+    num_nodes = adj.size(0)
+    device = adj.device
+    loop = torch.arange(num_nodes, device=device)
+    identity_indices = torch.stack([loop, loop], dim=0)
+    indices = torch.cat([identity_indices, adj.indices()], dim=1)
+    values = torch.cat([
+        torch.ones(num_nodes, device=device),
+        -adj.values()
+    ], dim=0)
+    return torch.sparse_coo_tensor(
+        indices,
+        values,
+        adj.size(),
+        device=device
+    ).coalesce()
+
+
+def build_training_adj(args, edge_index, num_nodes, device, dropedge=0.0, training=False, add_self_loop=True):
+    if args.model == 'acmgcn':
+        low = sparse_norm_adj(
+            edge_index,
+            num_nodes,
+            device,
+            dropedge=dropedge,
+            training=training,
+            add_self_loop=True,
+            norm='row'
+        )
+        high = sparse_identity_minus(low)
+        return low, high
+
+    return sparse_norm_adj(
+        edge_index,
+        num_nodes,
+        device,
+        dropedge=dropedge,
+        training=training,
+        add_self_loop=add_self_loop,
+        norm=args.adj_norm
+    )
 
 
 def smooth_cross_entropy(logits, target, smoothing):
@@ -723,7 +1133,9 @@ def fill_defaults(args):
         if args.data <= 2:
             args.model = 'gcnii'
         elif is_large_hetero_dataset(args.data):
-            args.model = 'gpr'
+            # LINKX is the strongest simple large-scale default on these
+            # benchmarks; MLP/GPR remain available as ablations.
+            args.model = 'linkx'
         else:
             args.model = 'h2gcn'
 
@@ -807,6 +1219,67 @@ def fill_defaults(args):
             'gpr_init': 'ppr'
         }
 
+    elif args.model == 'gcn':
+        preset = {
+            'epochs': 1000 if is_large_hetero_dataset(args.data) else 1500,
+            'patience': 200,
+            'hidden': 128,
+            'layers': 2,
+            'dropout': 0.5,
+            'lr': 0.01,
+            'wd1': 5e-4,
+            'wd2': 0.0,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_acc',
+            'propagation_steps': 0,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0,
+            'gpr_init': 'ppr'
+        }
+
+    elif args.model == 'mixhop':
+        preset = {
+            'epochs': 1000 if is_large_hetero_dataset(args.data) else 1500,
+            'patience': 200,
+            'hidden': 128 if args.data != 11 else 64,
+            'layers': 2,
+            'dropout': 0.5,
+            'lr': 0.01,
+            'wd1': 5e-4,
+            'wd2': 0.0,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_acc',
+            'propagation_steps': 2,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0,
+            'gpr_init': 'ppr'
+        }
+
+    elif args.model == 'acmgcn':
+        preset = {
+            'epochs': 500 if is_large_hetero_dataset(args.data) else 1500,
+            'patience': 150,
+            'hidden': 64 if is_large_hetero_dataset(args.data) else 128,
+            'layers': 2,
+            'dropout': 0.5,
+            'lr': 0.01,
+            'wd1': 1e-3,
+            'wd2': 0.0,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_acc',
+            'propagation_steps': 0,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0,
+            'gpr_init': 'ppr'
+        }
+
+
     elif args.model == 'gpr':
         hetero = is_hetero_dataset(args.data)
         large = is_large_hetero_dataset(args.data)
@@ -828,6 +1301,18 @@ def fill_defaults(args):
             'dropedge': 0.0,
             'gpr_init': 'alt' if hetero else 'ppr'
         }
+
+        if args.data in [10, 11]:
+            # Large heterophily benchmark setting: directed graph, K=10,
+            # alpha=0.1, random GPR coefficients and a BN MLP head.
+            preset.update({
+                'hidden': 128 if args.data == 10 else 64,
+                'alpha': 0.1,
+                'propagation_steps': 10,
+                'gpr_init': 'random',
+                'wd1': 1e-3,
+                'label_smoothing': 0.0
+            })
 
     elif args.model == 'mlp':
         preset = {
@@ -889,6 +1374,14 @@ def fill_defaults(args):
             'gpr_init': 'ppr'
         }
 
+        if args.data in [9, 10, 11]:
+            preset.update({
+                'epochs': 1000,
+                'patience': 200,
+                'hidden': 256 if args.data in [9, 10] else 64,
+                'wd1': 1e-3
+            })
+
     else:
         raise ValueError(f'unknown model: {args.model}')
 
@@ -920,7 +1413,8 @@ def build_model(args, in_dim, out_dim, num_nodes=None):
             args.mlp_layers,
             args.propagation_steps,
             args.alpha,
-            args.dropout
+            args.dropout,
+            use_bn=args.use_bn
         )
 
     if args.model == 'dagnn':
@@ -930,8 +1424,43 @@ def build_model(args, in_dim, out_dim, num_nodes=None):
             out_dim,
             args.mlp_layers,
             args.propagation_steps,
-            args.dropout
+            args.dropout,
+            use_bn=args.use_bn
         )
+
+    if args.model == 'gcn':
+        return GCNNet(
+            in_dim,
+            args.hidden,
+            out_dim,
+            args.layers,
+            args.dropout,
+            use_bn=args.use_bn
+        )
+
+    if args.model == 'mixhop':
+        return MixHopNet(
+            in_dim,
+            args.hidden,
+            out_dim,
+            args.layers,
+            args.propagation_steps,
+            args.dropout,
+            use_bn=args.use_bn
+        )
+
+    if args.model == 'acmgcn':
+        return ACMGCNNet(
+            in_dim,
+            args.hidden,
+            out_dim,
+            args.layers,
+            args.dropout,
+            use_bn=args.use_bn,
+            variant=args.variant,
+            plus_plus=args.acm_plus_plus
+        )
+
 
     if args.model == 'gpr':
         return GPRNet(
@@ -942,7 +1471,8 @@ def build_model(args, in_dim, out_dim, num_nodes=None):
             args.propagation_steps,
             args.alpha,
             args.dropout,
-            args.gpr_init
+            args.gpr_init,
+            use_bn=args.use_bn
         )
 
     if args.model == 'mlp':
@@ -951,7 +1481,8 @@ def build_model(args, in_dim, out_dim, num_nodes=None):
             args.hidden,
             out_dim,
             args.mlp_layers,
-            args.dropout
+            args.dropout,
+            use_bn=args.use_bn
         )
 
     if args.model == 'h2gcn':
@@ -960,7 +1491,8 @@ def build_model(args, in_dim, out_dim, num_nodes=None):
             args.hidden,
             out_dim,
             args.propagation_steps,
-            args.dropout
+            args.dropout,
+            use_bn=args.use_bn
         )
 
     if args.model == 'linkx':
@@ -972,7 +1504,13 @@ def build_model(args, in_dim, out_dim, num_nodes=None):
             num_nodes,
             args.hidden,
             out_dim,
-            args.dropout
+            args.dropout,
+            use_bn=args.use_bn,
+            skip=args.linkx_skip,
+            init_layers_x=args.linkx_init_layers,
+            final_layers=args.mlp_layers,
+            inner_activation=args.linkx_inner_activation,
+            inner_dropout=args.linkx_inner_dropout
         )
 
     raise ValueError(f'unknown model: {args.model}')
@@ -1038,9 +1576,10 @@ def run_once(run_seed, args, dataset, data, class_count, device):
 
     # Heterophily-specific models should not mix self information into neighbor
     # channels through self-loops. MLP ignores adj anyway.
-    add_self_loop = args.model not in ['h2gcn', 'linkx']
+    add_self_loop = args.model not in ['h2gcn', 'linkx', 'mixhop']
 
-    eval_adj = sparse_norm_adj(
+    eval_adj = build_training_adj(
+        args,
         local_data.edge_index,
         local_data.num_nodes,
         device,
@@ -1072,7 +1611,8 @@ def run_once(run_seed, args, dataset, data, class_count, device):
         model.train()
 
         if args.dropedge > 0.0:
-            train_adj = sparse_norm_adj(
+            train_adj = build_training_adj(
+                args,
                 local_data.edge_index,
                 local_data.num_nodes,
                 device,
@@ -1156,7 +1696,7 @@ def parse_args():
         '--model',
         type=str,
         default='auto',
-        choices=['auto', 'gcnii', 'appnp', 'dagnn', 'gpr', 'mlp', 'h2gcn', 'linkx']
+        choices=['auto', 'gcnii', 'appnp', 'dagnn', 'gcn', 'mixhop', 'acmgcn', 'gpr', 'mlp', 'h2gcn', 'linkx']
     )
 
     parser.add_argument('--root', type=str, default='/tmp')
@@ -1183,8 +1723,15 @@ def parse_args():
     parser.add_argument('--year-classes', type=int, default=5)
     parser.add_argument('--snap-patents-path', type=str, default=None)
 
-    parser.add_argument('--force-undirected', action='store_true', default=True)
+    parser.add_argument('--force-undirected', dest='force_undirected', action='store_true', default=None)
     parser.add_argument('--keep-directed', dest='force_undirected', action='store_false')
+    parser.add_argument(
+        '--adj-norm',
+        type=str,
+        default=None,
+        choices=['sym', 'row', 'none'],
+        help='Adjacency normalization. Defaults are dataset-specific.'
+    )
 
     parser.add_argument('--alpha', type=float, default=None)
     parser.add_argument('--lamda', type=float, default=None)
@@ -1203,18 +1750,60 @@ def parse_args():
     parser.add_argument('--grad-clip', type=float, default=0.0)
     parser.add_argument('--propagation-steps', type=int, default=None)
     parser.add_argument('--mlp-layers', type=int, default=None)
+    parser.add_argument('--use-bn', dest='use_bn', action='store_true', default=None)
+    parser.add_argument('--no-bn', dest='use_bn', action='store_false')
+    parser.add_argument('--linkx-skip', dest='linkx_skip', action='store_true', default=None)
+    parser.add_argument('--no-linkx-skip', dest='linkx_skip', action='store_false')
+    parser.add_argument('--linkx-init-layers', type=int, default=None)
+    parser.add_argument('--linkx-inner-activation', action='store_true', default=False)
+    parser.add_argument('--linkx-inner-dropout', action='store_true', default=False)
+    parser.add_argument('--acm-plus-plus', dest='acm_plus_plus', action='store_true', default=None)
+    parser.add_argument('--no-acm-plus-plus', dest='acm_plus_plus', action='store_false')
+    parser.add_argument('--use-fixed-large-splits', dest='use_fixed_large_splits', action='store_true', default=None)
+    parser.add_argument('--random-large-splits', dest='use_fixed_large_splits', action='store_false')
 
     parser.add_argument(
         '--gpr-init',
         type=str,
         default=None,
-        choices=['ppr', 'nppr', 'sgc', 'alt']
+        choices=['ppr', 'nppr', 'sgc', 'alt', 'random']
     )
 
     parser.add_argument('--quiet', action='store_true')
 
     args = parser.parse_args()
     args = fill_defaults(args)
+
+    # Dataset-specific switches for the three large heterophily benchmarks only.
+    # For data 0~8, these evaluate to the previous defaults: undirected + sym
+    # normalized adjacency, no BatchNorm, and no LINKX skip path.
+    if args.force_undirected is None:
+        args.force_undirected = args.data not in [10, 11]
+
+    if args.adj_norm is None:
+        if args.model == 'linkx' and args.data in [9, 10, 11]:
+            args.adj_norm = 'none'
+        elif args.model == 'acmgcn':
+            args.adj_norm = 'row'
+        elif args.data in [10, 11]:
+            args.adj_norm = 'row'
+        else:
+            args.adj_norm = 'sym'
+
+    if args.use_bn is None:
+        args.use_bn = args.data in [9, 10, 11]
+
+    if args.linkx_skip is None:
+        args.linkx_skip = args.model == 'linkx' and args.data in [9, 10, 11]
+
+    if args.linkx_init_layers is None:
+        args.linkx_init_layers = 1
+
+    if args.acm_plus_plus is None:
+        args.acm_plus_plus = args.model == 'acmgcn'
+
+    if args.use_fixed_large_splits is None:
+        args.use_fixed_large_splits = args.data in [10, 11]
 
     if args.weight_decay is not None:
         args.wd1 = args.weight_decay
@@ -1226,6 +1815,8 @@ def parse_args():
         raise ValueError('--val-prop must be in [0, 1)')
     if args.train_prop + args.val_prop >= 1.0:
         raise ValueError('--train-prop + --val-prop must be < 1')
+    if args.linkx_init_layers < 1:
+        raise ValueError('--linkx-init-layers must be >= 1')
 
     return args
 
