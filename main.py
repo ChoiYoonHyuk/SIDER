@@ -286,17 +286,81 @@ def fill_defaults(args):
         args.model = 'gcnii'
     preset = {}
     if args.model == 'gcnii':
-        preset = {'epochs': 1500, 'patience': 100, 'hidden': 64, 'layers': 64, 'dropout': 0.6, 'lr': 0.01, 'wd1': 0.01, 'wd2': 5e-4, 'alpha': 0.1, 'lamda': 0.5, 'selection': 'val_loss', 'propagation_steps': 10, 'mlp_layers': 2, 'label_smoothing': 0.0, 'dropedge': 0.0}
+        preset = {
+            'epochs': 1500,
+            'patience': 100,
+            'hidden': 64,
+            'layers': 64,
+            'dropout': 0.6,
+            'lr': 0.01,
+            'wd1': 0.01,
+            'wd2': 5e-4,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_loss',
+            'propagation_steps': 10,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0
+        }
         if args.data == 1:
             preset.update({'hidden': 256, 'layers': 32, 'dropout': 0.7, 'lamda': 0.6})
         if args.data == 2:
             preset.update({'hidden': 256, 'layers': 16, 'dropout': 0.5, 'lamda': 0.4, 'wd1': 5e-4})
     elif args.model == 'appnp':
-        preset = {'epochs': 1500, 'patience': 200, 'hidden': 64, 'layers': 2, 'dropout': 0.5, 'lr': 0.01, 'wd1': 5e-4, 'wd2': 0.0, 'alpha': 0.1, 'lamda': 0.5, 'selection': 'val_acc', 'propagation_steps': 10, 'mlp_layers': 2, 'label_smoothing': 0.0, 'dropedge': 0.0}
+        preset = {
+            'epochs': 1500,
+            'patience': 200,
+            'hidden': 64,
+            'layers': 2,
+            'dropout': 0.5,
+            'lr': 0.01,
+            'wd1': 5e-4,
+            'wd2': 0.0,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_acc',
+            'propagation_steps': 10,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0
+        }
     elif args.model == 'dagnn':
-        preset = {'epochs': 1500, 'patience': 200, 'hidden': 128, 'layers': 2, 'dropout': 0.5, 'lr': 0.01, 'wd1': 5e-4, 'wd2': 0.0, 'alpha': 0.1, 'lamda': 0.5, 'selection': 'val_acc', 'propagation_steps': 10, 'mlp_layers': 2, 'label_smoothing': 0.0, 'dropedge': 0.0}
+        preset = {
+            'epochs': 1500,
+            'patience': 200,
+            'hidden': 128,
+            'layers': 2,
+            'dropout': 0.5,
+            'lr': 0.01,
+            'wd1': 5e-4,
+            'wd2': 0.0,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_acc',
+            'propagation_steps': 10,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0
+        }
     elif args.model == 'gpr':
-        preset = {'epochs': 1500, 'patience': 200, 'hidden': 64, 'layers': 2, 'dropout': 0.5, 'lr': 0.01, 'wd1': 5e-4, 'wd2': 0.0, 'alpha': 0.1, 'lamda': 0.5, 'selection': 'val_acc', 'propagation_steps': 10, 'mlp_layers': 2, 'label_smoothing': 0.0, 'dropedge': 0.0}
+        preset = {
+            'epochs': 1500,
+            'patience': 200,
+            'hidden': 64,
+            'layers': 2,
+            'dropout': 0.5,
+            'lr': 0.01,
+            'wd1': 5e-4,
+            'wd2': 0.0,
+            'alpha': 0.1,
+            'lamda': 0.5,
+            'selection': 'val_acc',
+            'propagation_steps': 10,
+            'mlp_layers': 2,
+            'label_smoothing': 0.0,
+            'dropedge': 0.0
+        }
     for key, value in preset.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
@@ -317,7 +381,13 @@ def build_model(args, in_dim, out_dim):
 
 def build_optimizer(model, args):
     if args.model == 'gcnii':
-        return torch.optim.Adam([{'params': model.params1, 'weight_decay': args.wd1}, {'params': model.params2, 'weight_decay': args.wd2}], lr=args.lr)
+        return torch.optim.Adam(
+            [
+                {'params': model.params1, 'weight_decay': args.wd1},
+                {'params': model.params2, 'weight_decay': args.wd2}
+            ],
+            lr=args.lr
+        )
     decay = []
     no_decay = []
     for name, param in model.named_parameters():
@@ -327,7 +397,13 @@ def build_optimizer(model, args):
             no_decay.append(param)
         else:
             decay.append(param)
-    return torch.optim.Adam([{'params': decay, 'weight_decay': args.wd1}, {'params': no_decay, 'weight_decay': 0.0}], lr=args.lr)
+    return torch.optim.Adam(
+        [
+            {'params': decay, 'weight_decay': args.wd1},
+            {'params': no_decay, 'weight_decay': 0.0}
+        ],
+        lr=args.lr
+    )
 
 
 def is_better(args, val_loss, val_acc, best_val_loss, best_val_acc):
@@ -347,29 +423,38 @@ def run_once(run_seed, args, dataset, data, class_count, device):
     local_data.train_mask = data.train_mask.to(device)
     local_data.val_mask = data.val_mask.to(device)
     local_data.test_mask = data.test_mask.to(device)
+
     eval_adj = sparse_norm_adj(local_data.edge_index, local_data.num_nodes, device, 0.0, False)
     model = build_model(args, dataset.num_node_features, class_count).to(device)
     optimizer = build_optimizer(model, args)
+
     best_state = None
     best_epoch = 0
     best_val_loss = float('inf')
     best_val_acc = -1.0
     best_test_acc = 0.0
     bad_epochs = 0
+
     progress = tqdm(range(args.epochs), disable=args.quiet)
     start_time = time.time()
+
     for epoch in progress:
         model.train()
         train_adj = sparse_norm_adj(local_data.edge_index, local_data.num_nodes, device, args.dropedge, True) if args.dropedge > 0.0 else eval_adj
+
         optimizer.zero_grad()
         logits = model(local_data.x, train_adj)
         loss = smooth_cross_entropy(logits[local_data.train_mask], local_data.y[local_data.train_mask], args.label_smoothing)
         loss.backward()
+
         if args.grad_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
         optimizer.step()
+
         if epoch % args.eval_every == 0 or epoch == args.epochs - 1:
             _, train_loss, val_loss, test_loss, train_acc, val_acc, test_acc = evaluate(model, local_data, eval_adj)
+
             if is_better(args, val_loss, val_acc, best_val_loss, best_val_acc):
                 best_state = copy.deepcopy(model.state_dict())
                 best_epoch = epoch
@@ -379,14 +464,29 @@ def run_once(run_seed, args, dataset, data, class_count, device):
                 bad_epochs = 0
             else:
                 bad_epochs += args.eval_every
-            progress.set_postfix(loss=float(loss.item()), val=val_acc, test=test_acc, best=best_test_acc)
+
+            progress.set_postfix(best_test=best_test_acc)
+
             if bad_epochs >= args.patience:
                 break
+
     if best_state is not None:
         model.load_state_dict(best_state)
+
     _, train_loss, val_loss, test_loss, train_acc, val_acc, test_acc = evaluate(model, local_data, eval_adj)
     elapsed = time.time() - start_time
-    return {'seed': run_seed, 'epoch': best_epoch, 'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss, 'train_acc': train_acc, 'val_acc': val_acc, 'test_acc': test_acc, 'best_val_acc': best_val_acc, 'best_test_acc': best_test_acc, 'time': elapsed}
+
+    return {
+        'seed': run_seed,
+        'epoch': best_epoch,
+        'best_train_loss': train_loss,
+        'best_val_loss': val_loss,
+        'best_test_loss': test_loss,
+        'best_train_acc': train_acc,
+        'best_val_acc': val_acc,
+        'best_test_acc': test_acc,
+        'time': elapsed
+    }
 
 
 def parse_args():
@@ -424,34 +524,51 @@ def parse_args():
     parser.add_argument('--mlp-layers', type=int, default=None)
     parser.add_argument('--gpr-init', type=str, default='ppr', choices=['ppr', 'nppr', 'sgc'])
     parser.add_argument('--quiet', action='store_true')
+
     args = parser.parse_args()
     args = fill_defaults(args)
+
     if args.weight_decay is not None:
         args.wd1 = args.weight_decay
         args.wd2 = args.weight_decay
+
     return args
 
 
 def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     set_seed(args.seed)
     dataset, data, class_count = load_dataset(args.data, args)
+
     results = []
+
     for run in range(args.runs):
         result = run_once(args.seed + run, args, dataset, data, class_count, device)
         results.append(result)
-        print('run', run, 'seed', result['seed'], 'epoch', result['epoch'], 'train_acc', result['train_acc'], 'val_acc', result['val_acc'], 'test_acc', result['test_acc'], 'time', result['time'])
-    vals = np.array([r['val_acc'] for r in results], dtype=np.float64)
-    tests = np.array([r['test_acc'] for r in results], dtype=np.float64)
+        print(
+            'run', run,
+            'seed', result['seed'],
+            'best_epoch', result['epoch'],
+            'best_train_acc', result['best_train_acc'],
+            'best_val_acc', result['best_val_acc'],
+            'best_test_acc', result['best_test_acc'],
+            'time', result['time']
+        )
+
+    vals = np.array([r['best_val_acc'] for r in results], dtype=np.float64)
+    tests = np.array([r['best_test_acc'] for r in results], dtype=np.float64)
     times = np.array([r['time'] for r in results], dtype=np.float64)
+
     print('dataset', dataset.__class__.__name__)
     print('model', args.model)
     print('split', args.split)
-    print('mean_val_acc', float(vals.mean()))
-    print('std_val_acc', float(vals.std()))
-    print('mean_test_acc', float(tests.mean()))
-    print('std_test_acc', float(tests.std()))
+    print('selection', args.selection)
+    print('mean_best_val_acc', float(vals.mean()))
+    print('std_best_val_acc', float(vals.std()))
+    print('mean_val_selected_test_acc', float(tests.mean()))
+    print('std_val_selected_test_acc', float(tests.std()))
     print('mean_time', float(times.mean()))
     print('config', vars(args))
 
