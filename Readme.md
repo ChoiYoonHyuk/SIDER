@@ -135,11 +135,3 @@ When `--model auto` is used:
 | `3`-`8` | Small heterophilic graphs | `h2gcn` |
 | `9`-`11` | Large heterophilic graphs | `gpr` |
 
-
-## Notes
-
-- For `h2gcn` and `linkx`, self-loops are not added to the normalized adjacency. This avoids prematurely mixing ego and neighbor channels in heterophilic settings.
-- For `gpr` on heterophilic datasets, the default initialization uses alternating signed propagation weights through `--gpr-init alt`.
-- For `arXiv-year` and `snap-patents`, continuous years are converted into balanced ordinal classes using quantile binning.
-- `snap-patents` can be downloaded automatically with `gdown`, or loaded from a local `.mat` file using `--snap-patents-path`.
-
