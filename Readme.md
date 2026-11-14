@@ -2,7 +2,7 @@
 
 ## Overview
 
-**SIDER: Syndrome-Guided Edge-Relation Decoding for Heterophilic Graph Mining** provides a single-node-classification training pipeline for both homophilic and heterophilic graph benchmarks.
+**Syndrome-Guided Edge-Relation Decoding for Heterophilic Graph Mining** provides a single-node-classification training pipeline for both homophilic and heterophilic graph benchmarks.
 
 The current implementation includes multiple graph-learning backbones and automatically selects a suitable default model depending on the dataset type:
 
